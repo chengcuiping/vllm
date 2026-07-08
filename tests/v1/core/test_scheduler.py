@@ -4796,9 +4796,7 @@ def test_priority_preemption_at_max_num_seqs_e2e():
     # before lo1 (arrival 1.0).
     output = scheduler.schedule()
 
-    hi_scheduled = any(
-        req.req_id == "hi" for req in output.scheduled_new_reqs
-    )
+    hi_scheduled = any(req.req_id == "hi" for req in output.scheduled_new_reqs)
     assert hi_scheduled, (
         "High-priority request 'hi' should have been scheduled "
         "after preempting a low-priority runner"
@@ -4872,9 +4870,7 @@ def test_priority_preemption_at_max_num_seqs_no_preempt_when_not_higher():
     # Schedule — should NOT preempt since lo has lower priority.
     output = scheduler.schedule()
 
-    lo_scheduled = any(
-        req.req_id == "lo" for req in output.scheduled_new_reqs
-    )
+    lo_scheduled = any(req.req_id == "lo" for req in output.scheduled_new_reqs)
     assert not lo_scheduled, (
         "Low-priority 'lo' should NOT have been scheduled "
         "— all running requests have higher priority"
@@ -4941,9 +4937,7 @@ def test_priority_preemption_at_max_num_seqs_equal_priority_no_preempt():
 
     output = scheduler.schedule()
 
-    w1_scheduled = any(
-        req.req_id == "w1" for req in output.scheduled_new_reqs
-    )
+    w1_scheduled = any(req.req_id == "w1" for req in output.scheduled_new_reqs)
     assert not w1_scheduled, (
         "Equal-priority waiting request 'w1' must NOT preempt "
         "(same priority = no preemption)"

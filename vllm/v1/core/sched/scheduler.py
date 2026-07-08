@@ -622,9 +622,7 @@ class Scheduler(SchedulerInterface):
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
-                num_running = (
-                    len(self.running) + self.num_waiting_for_streaming_input
-                )
+                num_running = len(self.running) + self.num_waiting_for_streaming_input
                 if num_running >= self.max_num_running_reqs:
                     break
 
@@ -1120,9 +1118,7 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
 
-    def _priority_preempt_for_slot(
-        self, scheduled_timestamp: float
-    ) -> Request | None:
+    def _priority_preempt_for_slot(self, scheduled_timestamp: float) -> Request | None:
         """PRIORITY pre-pass: free one seq slot for a higher-priority waiter.
 
         When ``max_num_seqs`` is the binding constraint (the running batch is
