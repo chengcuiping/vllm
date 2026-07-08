@@ -5172,3 +5172,154 @@ def test_async_load_reservation_prevents_wedge_e2e():
     assert b.status == RequestStatus.WAITING
     assert b.num_preemptions == 0
     assert b.request_id not in req_to_blocks
+
+
+# ── Issue #40004: PRIORITY pre-pass slot preemption ─────────────────────────
+
+
+def _decode_step(scheduler, output, req_ids):
+    """Feed one sampled token back for each scheduled request."""
+    scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=list(req_ids),
+            req_id_to_index={r: i for i, r in enumerate(req_ids)},
+            sampled_token_ids=[[100] for _ in req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
+    )
+
+
+def test_prepass_preempts_at_max_num_seqs():
+    """High-priority waiter preempts the lowest-priority runner when the
+    running queue is full (max_num_seqs), no KV pressure (#45558 scenario 1)."""
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2, max_num_batched_tokens=512, num_blocks=10000
+    )
+    lo1, lo2 = create_requests_with_priority(
+        num_requests=2,
+        priorities=[5, 5],
+        arrival_times=[1.0, 2.0],
+        num_tokens=10,
+        req_ids=["lo1", "lo2"],
+    )
+    scheduler.add_request(lo1)
+    scheduler.add_request(lo2)
+    out = scheduler.schedule()
+    assert len(scheduler.running) == 2
+    _decode_step(scheduler, out, ["lo1", "lo2"])
+
+    hi = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[3.0],
+        num_tokens=10,
+        req_ids=["hi"],
+    )[0]
+    scheduler.add_request(hi)
+    out = scheduler.schedule()
+
+    assert "hi" in {r.request_id for r in scheduler.running}
+    assert out.preempted_req_ids and len(out.preempted_req_ids) == 1
+    preempted = [
+        r
+        for r in (scheduler.requests["lo1"], scheduler.requests["lo2"])
+        if r.status == RequestStatus.PREEMPTED
+    ]
+    assert len(preempted) == 1
+    assert len(scheduler.running) == 2
+
+
+def test_prepass_no_preempt_equal_priority():
+    """Equal-priority waiter (even arrived earlier) must NOT preempt, to avoid
+    ping-pong (#45558 scenario 2)."""
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=2, max_num_batched_tokens=512, num_blocks=10000
+    )
+    r1, r2 = create_requests_with_priority(
+        num_requests=2,
+        priorities=[5, 5],
+        arrival_times=[2.0, 3.0],
+        num_tokens=10,
+        req_ids=["r1", "r2"],
+    )
+    scheduler.add_request(r1)
+    scheduler.add_request(r2)
+    out = scheduler.schedule()
+    _decode_step(scheduler, out, ["r1", "r2"])
+
+    w1 = create_requests_with_priority(
+        num_requests=1,
+        priorities=[5],
+        arrival_times=[1.0],
+        num_tokens=10,
+        req_ids=["w1"],
+    )[0]
+    scheduler.add_request(w1)
+    out = scheduler.schedule()
+
+    assert not out.preempted_req_ids
+    assert scheduler.requests["w1"].status == RequestStatus.WAITING
+    assert len(scheduler.running) == 2
+
+
+def test_prepass_fcfs_invariant():
+    """Red line: under FCFS the pre-pass must never fire. A full running queue
+    plus a new waiter yields zero preemptions and an unchanged running set."""
+    scheduler = create_scheduler(max_num_seqs=2, num_blocks=10000)
+    r1, r2 = create_requests(num_requests=2, num_tokens=10, req_ids=["r1", "r2"])
+    scheduler.add_request(r1)
+    scheduler.add_request(r2)
+    out = scheduler.schedule()
+    _decode_step(scheduler, out, ["r1", "r2"])
+    running_before = [r.request_id for r in scheduler.running]
+
+    w = create_requests(num_requests=1, num_tokens=10, req_ids=["w"])[0]
+    scheduler.add_request(w)
+    out = scheduler.schedule()
+
+    assert not out.preempted_req_ids
+    assert [r.request_id for r in scheduler.running] == running_before
+    assert scheduler.requests["w"].status == RequestStatus.WAITING
+
+
+def test_prepass_chunked_prefill_victim():
+    """A victim caught mid chunked-prefill is preempted correctly: its partial
+    prefill is discarded (num_computed_tokens reset) and the waiter admitted."""
+    # max_num_batched_tokens < prompt so prefill is chunked across steps.
+    scheduler = create_scheduler_with_priority(
+        max_num_seqs=1,
+        max_num_batched_tokens=16,
+        num_blocks=10000,
+        block_size=16,
+    )
+    lo = create_requests_with_priority(
+        num_requests=1,
+        priorities=[5],
+        arrival_times=[1.0],
+        num_tokens=48,
+        req_ids=["lo"],
+    )[0]
+    scheduler.add_request(lo)
+    scheduler.schedule()
+    # lo is mid-prefill: only part of its 48 prompt tokens are computed.
+    assert lo in scheduler.running
+    assert 0 < scheduler.requests["lo"].num_computed_tokens < 48
+
+    hi = create_requests_with_priority(
+        num_requests=1,
+        priorities=[0],
+        arrival_times=[2.0],
+        num_tokens=10,
+        req_ids=["hi"],
+    )[0]
+    scheduler.add_request(hi)
+    out = scheduler.schedule()
+
+    assert scheduler.requests["lo"].status == RequestStatus.PREEMPTED
+    # RECOMPUTE semantics: partial prefill progress is thrown away.
+    assert scheduler.requests["lo"].num_computed_tokens == 0
+    assert "hi" in {r.request_id for r in scheduler.running}
+    assert out.preempted_req_ids == {"lo"}
