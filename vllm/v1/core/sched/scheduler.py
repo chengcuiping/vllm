@@ -437,6 +437,13 @@ class Scheduler(SchedulerInterface):
             throttle_prefills and not self.prefill_capacity_bound
         ) and any(not r.is_prefill_chunk for r in self.running)
 
+        # Priority pre-pass (issue #40004): when max_num_seqs is the binding
+        # constraint, free one seq slot for a strictly-higher-priority waiter
+        # BEFORE the running loop accrues any state, so there is nothing to
+        # roll back. No-op for FCFS and when the running batch is not full.
+        if self.policy == SchedulingPolicy.PRIORITY:
+            self._priority_preempt_for_slot(scheduled_timestamp)
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -1165,6 +1172,37 @@ class Scheduler(SchedulerInterface):
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
         self.reset_preempted_req_ids.add(request.request_id)
+
+    def _priority_preempt_for_slot(self, scheduled_timestamp: float) -> None:
+        """PRIORITY pre-pass: free one seq slot for a higher-priority waiter.
+
+        When ``max_num_seqs`` is the binding constraint (the running batch is
+        full), preempt the single lowest-priority running request iff the
+        highest-priority admittable waiting request is *strictly* higher
+        priority. This runs before the running loop, so the victim never
+        accrues scheduling state this step and there is nothing to roll back.
+        ``_preempt_request`` reports the victim via ``reset_preempted_req_ids``.
+
+        Only called under PRIORITY policy, so FCFS is untouched.
+        """
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
+        if num_running < self.max_num_running_reqs or not self.running:
+            return
+        request_queue = self._select_waiting_queue_for_scheduling()
+        if request_queue is None:
+            return
+        best_waiting = request_queue.peek_request()
+        # Don't evict for a waiter that cannot be admitted this step anyway.
+        if self._is_blocked_waiting_status(best_waiting.status):
+            return
+        worst_running = max(self.running, key=lambda r: (r.priority, r.arrival_time))
+        # Strict priority only (lower value == higher priority). Equal priority
+        # must not preempt: the victim keeps its arrival_time and would reclaim
+        # the slot next step, causing ping-pong.
+        if best_waiting.priority >= worst_running.priority:
+            return
+        self.running.remove(worst_running)
+        self._preempt_request(worst_running, scheduled_timestamp)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
