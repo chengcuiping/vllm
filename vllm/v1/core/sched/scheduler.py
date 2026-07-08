@@ -416,6 +416,13 @@ class Scheduler(SchedulerInterface):
 
         self.kv_cache_manager.new_step_starts()
 
+        # Priority pre-pass (issue #40004): when max_num_seqs is the binding
+        # constraint, free one seq slot for a strictly-higher-priority waiter
+        # before the running loop accrues any state, so there is nothing to
+        # roll back. No-op for FCFS and when the running batch is not full.
+        if self.policy == SchedulingPolicy.PRIORITY:
+            self._priority_preempt_for_slot(scheduled_timestamp)
+
         # First, schedule the RUNNING requests.
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
@@ -605,120 +612,18 @@ class Scheduler(SchedulerInterface):
             )
             assert len(scheduled_loras) <= self.lora_config.max_loras
 
-        # Helper: evict a running request to make room for a
-        # higher-priority waiting request.  Undoes any scheduling
-        # already done for the victim in this step.
-        def _evict_runner(victim: Request) -> None:
-            self.running.remove(victim)
-            if victim in scheduled_running_reqs:
-                scheduled_running_reqs.remove(victim)
-                victim_id = victim.request_id
-                nonlocal token_budget
-                token_budget += num_scheduled_tokens.pop(victim_id)
-                req_to_new_blocks.pop(victim_id)
-                scheduled_spec_decode_tokens.pop(victim_id, None)
-                victim_encoder = scheduled_encoder_inputs.pop(
-                    victim_id, None
-                )
-                if victim_encoder:
-                    nonlocal encoder_compute_budget
-                    encoder_compute_budget += sum(
-                        victim.get_num_encoder_embeds(i)
-                        for i in victim_encoder
-                    )
-                # Discard the victim's LoRA only when no remaining
-                # scheduled request still uses it.
-                if self.lora_config and victim.lora_request:
-                    lora_id = victim.lora_request.lora_int_id
-                    if lora_id > 0 and not any(
-                        req.lora_request
-                        and req.lora_request.lora_int_id == lora_id
-                        for req in scheduled_running_reqs
-                    ):
-                        scheduled_loras.discard(lora_id)
-            self._preempt_request(victim, scheduled_timestamp)
-            preempted_reqs.append(victim)
-
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
             step_skipped_waiting = create_request_queue(self.policy)
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
-                if len(self.running) == self.max_num_running_reqs:
-                    if self.policy == SchedulingPolicy.PRIORITY:
-                        # Priority-based preemption at max_num_seqs:
-                        # A higher-priority waiting request can preempt a
-                        # lower-priority running request.  Run the blocked-
-                        # status and max_loras admission checks first so we
-                        # don't evict a runner for a request that can't be
-                        # admitted this step.
-                        request_queue = self._select_waiting_queue_for_scheduling()
-                        if request_queue is None:
-                            break
-                        request = request_queue.peek_request()
-                        request_id = request.request_id
-
-                        # Blocked-status check: don't preempt for a request
-                        # that is still waiting on async deps.
-                        if self._is_blocked_waiting_status(
-                            request.status
-                        ) and not self._try_promote_blocked_waiting_request(
-                            request
-                        ):
-                            if (
-                                request.status
-                                == RequestStatus.WAITING_FOR_REMOTE_KVS
-                            ):
-                                logger.debug(
-                                    "%s is still in "
-                                    "WAITING_FOR_REMOTE_KVS state.",
-                                    request_id,
-                                )
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
-
-                        # Max_loras check: don't preempt if the waiting
-                        # request would exceed the LoRA limit.
-                        if (
-                            self.lora_config
-                            and request.lora_request
-                            and (
-                                len(scheduled_loras)
-                                == self.lora_config.max_loras
-                                and request.lora_request.lora_int_id
-                                not in scheduled_loras
-                            )
-                        ):
-                            request_queue.pop_request()
-                            step_skipped_waiting.prepend_request(request)
-                            continue
-
-                        # Find the lowest-priority running request.
-                        lowest_priority_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-
-                        # Preempt only for strictly higher priority
-                        # (lower numerical value).  Equal priority must
-                        # not preempt — it causes ping-pong since the
-                        # preempted request keeps its earlier arrival
-                        # time and would immediately reclaim the slot.
-                        if (
-                            request.priority
-                            >= lowest_priority_req.priority
-                        ):
-                            break
-
-                        # Evict the lowest-priority runner to make
-                        # room for the higher-priority waiter.
-                        _evict_runner(lowest_priority_req)
-                        # Loop back to schedule the waiting request
-                        # (len(self.running) is now < max_num_running_reqs).
-                        continue
-                    else:
-                        break
+                # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
+                # in `running` but still hold a model-runner request slot.
+                num_running = (
+                    len(self.running) + self.num_waiting_for_streaming_input
+                )
+                if num_running >= self.max_num_running_reqs:
+                    break
 
                 request_queue = self._select_waiting_queue_for_scheduling()
                 assert request_queue is not None
@@ -978,26 +883,6 @@ class Scheduler(SchedulerInterface):
                     if request.has_encoder_inputs:
                         self.encoder_cache_manager.free(request)
 
-                    # Priority-based preemption for KV cache pressure:
-                    # free blocks by preempting the lowest-priority runner
-                    # so this higher-priority waiting request can fit.
-                    if (
-                        self.policy == SchedulingPolicy.PRIORITY
-                        and self.running
-                    ):
-                        lowest_priority_req = max(
-                            self.running,
-                            key=lambda r: (r.priority, r.arrival_time),
-                        )
-                        if (
-                            request.priority
-                            < lowest_priority_req.priority
-                        ):
-                            _evict_runner(lowest_priority_req)
-                            # Retry allocation for this waiting
-                            # request with the freed blocks.
-                            continue
-
                     break
 
                 # KVTransfer: the connector uses this info to determine
@@ -1226,6 +1111,38 @@ class Scheduler(SchedulerInterface):
 
         # Put the request back to the waiting queue.
         self.waiting.prepend_request(request)
+        self.reset_preempted_req_ids.add(request.request_id)
+
+    def _priority_preempt_for_slot(self, scheduled_timestamp: float) -> None:
+        """PRIORITY pre-pass: free one seq slot for a higher-priority waiter.
+
+        When ``max_num_seqs`` is the binding constraint (the running batch is
+        full), preempt the single lowest-priority running request iff the
+        highest-priority admittable waiting request is *strictly* higher
+        priority. This runs before the running loop, so the victim never
+        accrues scheduling state this step and there is nothing to roll back.
+        ``_preempt_request`` reports the victim via ``reset_preempted_req_ids``.
+
+        Only called under PRIORITY policy, so FCFS is untouched.
+        """
+        num_running = len(self.running) + self.num_waiting_for_streaming_input
+        if num_running < self.max_num_running_reqs or not self.running:
+            return
+        request_queue = self._select_waiting_queue_for_scheduling()
+        if request_queue is None:
+            return
+        best_waiting = request_queue.peek_request()
+        # Don't evict for a waiter that cannot be admitted this step anyway.
+        if self._is_blocked_waiting_status(best_waiting.status):
+            return
+        worst_running = max(self.running, key=lambda r: (r.priority, r.arrival_time))
+        # Strict priority only (lower value == higher priority). Equal priority
+        # must not preempt: the victim keeps its arrival_time and would reclaim
+        # the slot next step, causing ping-pong.
+        if best_waiting.priority >= worst_running.priority:
+            return
+        self.running.remove(worst_running)
+        self._preempt_request(worst_running, scheduled_timestamp)
 
     def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
         # Advance the number of computed tokens for the request AFTER
