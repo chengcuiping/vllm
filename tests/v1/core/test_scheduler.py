@@ -4995,10 +4995,10 @@ def test_priority_preemption_at_max_num_seqs_blocked_skipped():
         req_ids=["blocked_hi"],
     )[0]
     blocked_req.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-    scheduler.add_request(blocked_req)
-    # Move to skipped queue simulating a previously skipped request.
+    scheduler.requests[blocked_req.request_id] = blocked_req
+    # Put it in the skipped queue directly, simulating a previously skipped
+    # request without depending on add_request() for a non-WAITING status.
     scheduler.skipped_waiting.add_request(blocked_req)
-    scheduler.waiting.pop_request()
 
     # Schedule — should NOT preempt because blocked_hi can't be
     # admitted yet.
@@ -5008,19 +5008,15 @@ def test_priority_preemption_at_max_num_seqs_blocked_skipped():
         "Runner must NOT be preempted for a blocked waiting request"
     )
     assert len(scheduler.running) == 1
+    assert not output.preempted_req_ids
 
 
-def test_priority_preemption_at_kv_cache_pressure_e2e():
-    """Test that under KV cache pressure, a higher-priority waiting request
-    preempts a lower-priority running request to free blocks.
+def test_priority_prepass_does_not_preempt_at_kv_cache_pressure_e2e():
+    """The pre-pass is intentionally limited to max_num_seqs slot pressure.
 
-    Scenario:
-    - block_size = 16, num_blocks = 5 (4 usable after null block).
-    - lo1 (priority 5, 32 tokens) runs first → 2 blocks used. Decode → 33
-      tokens (needs 3rd block on next schedule).
-    - hi (priority 0, 32 tokens) arrives in the waiting queue.
-    - lo1's 3rd block is allocated (3 used), hi can't fit (needs 2 blocks,
-      only 1 free) → hi preempts lo1 and takes the slot.
+    Under admit-time KV cache pressure, a higher-priority waiting request does
+    not evict a lower-priority runner in this PR; that allocation-retry path is
+    left to a follow-up.
     """
     block_size = 16
     num_blocks = 5  # 1 null → 4 usable
@@ -5070,24 +5066,19 @@ def test_priority_preemption_at_kv_cache_pressure_e2e():
     )[0]
     scheduler.add_request(hi)
 
-    # schedule(): lo1 gets its 3rd block (3 used, 1 free).  hi needs
-    # 2 blocks but only 1 is free → block allocation fails for hi.
-    # With the new KV-cache preemption, hi (priority 0) preempts
-    # lo1 (priority 5) to free blocks.
+    # schedule(): lo1 gets its 3rd block (3 used, 1 free). hi needs
+    # 2 blocks but only 1 is free, so admission fails without a preemption
+    # retry. This PR deliberately avoids the rollback bookkeeping needed for
+    # that admit-time KV-pressure path.
     output = scheduler.schedule()
 
-    # lo1 should be preempted.
     lo1_req = scheduler.requests["lo1"]
-    assert lo1_req.status == RequestStatus.PREEMPTED, (
-        f"Expected lo1 to be preempted, got {lo1_req.status}"
-    )
+    assert lo1_req.status == RequestStatus.RUNNING
 
-    # hi should be in the running queue.
     hi_req = scheduler.requests["hi"]
-    assert hi_req.status == RequestStatus.RUNNING, (
-        f"Expected hi to be running, got {hi_req.status}"
-    )
-    assert hi_req in scheduler.running
+    assert hi_req.status == RequestStatus.WAITING
+    assert hi_req in scheduler.waiting
+    assert not output.preempted_req_ids
 
 
 def test_async_load_reservation_prevents_wedge_e2e():
